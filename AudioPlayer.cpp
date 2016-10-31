@@ -1,10 +1,9 @@
-#include "AudioPlayer.h"
-#include "UtilsWanakaFramework.h"
-#include "WanakaAudioPlayer.h"
-#include <Dsound.h>
+Ôªø#include "AudioPlayer.h"
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
-#include <iostream>
+#include "UtilsWanakaFramework.h"
+#include "WanakaAudioPlayer.h"
+
 extern "C" {
     //SDL
 #include "SDL.h"
@@ -18,60 +17,84 @@ using namespace RubberBand;
 #define SDL_AUDIO_BUFFER_SIZE 8192
 #define MAX_AUDIOQ_SIZE (5 * 16 * 8192)
 
-static AudioPlayer* sInstance = nullptr;
-
 static int sProcessIndex = 0;
 static int sCurCopyIndex = 0;
 static double sFirstSoundTime = 0.f;
 static double sStartTimePoint = 0.f;
 static double sCurTimePoint = 0.f;
+static int sSdlBuffLen = 0;
+static bool isCurVolumeChanged = false;
 //======================================================
-//sdlµ˜”√µƒ“Ù∆µ¥¶¿Ì∫Ø ˝
+//sdlË∞ÉÁî®ÁöÑÈü≥È¢ëÂ§ÑÁêÜÂáΩÊï∞
 //======================================================
 /*static */void processAudio(AudioPlayer* player, uint8_t* stream, int len) {
+    player->process();
+
     int needCopy = 0;
     bool isCopyComplete = false;
-	bool isChangeVolume = false;
+    bool isNeedUpdate = false;
     while (len > 0) {
-        player->_lock.lock();
+        std::lock_guard<std::recursive_mutex> lock(player->_rLock);
+        if (player->_quit) {
+            return;
+        }
+
         if (player->_audioDataVec.size() > sProcessIndex) {
             if (sFirstSoundTime > -0.0000001 && sFirstSoundTime < 0.000001) {
                 sFirstSoundTime = UtilsWanakaFramework::getUnixTimestamp();
                 sStartTimePoint = sCurTimePoint = sFirstSoundTime;
             }
             audioDataFrame audioData = player->_audioDataVec[sProcessIndex];
-			if (player->_volume < 1.f) {
-					for (int i = 0; i < audioData.size; i++) {
-						audioData.data[i] *= player->_volume;
-					}
-			}
+            if (!isCurVolumeChanged && player->_volume < 1.f) {//ÈúÄË¶ÅË∞ÉËäÇÂ£∞Èü≥
+                //log("player->_audioDataVec.size() = %d, sProcessIndex = %d", player->_audioDataVec.size(), sProcessIndex);
+                for (int i = 0; i < audioData.size; i++) {
+                    audioData.data[i] *= player->_volume;
+                }
+                isCurVolumeChanged = true;
+            }
             int leftByteOfAudioData = audioData.size * sizeof(float) - sCurCopyIndex;
             if (len >= leftByteOfAudioData) {
                 needCopy = leftByteOfAudioData;
                 isCopyComplete = true;
-                sProcessIndex += 1;
             }
             else {
                 needCopy = len;
             }
             len -= needCopy;
             memcpy(stream, ((uint8_t*)audioData.data + sCurCopyIndex), needCopy);
-			std::cout<<"player->_audioDataVec.size() / sProcessIndex = "<<player->_audioDataVec.size()<< " "<<sProcessIndex << endl;
+            if (!isNeedUpdate) {
+                isNeedUpdate = true;
+                player->_curPlayTick = UtilsWanakaFramework::getUnixTimestamp();
+                //ËÆ°ÁÆóÂΩìÂâçÊí≠ÊîæÁöÑ‰ΩçÁΩÆ
+                int curPlayIndex = player->_skipDataSize;
+                for (int i = 0; i < sProcessIndex; i++) {
+                    curPlayIndex += player->_audioDataVec[i].size;
+                }
+                player->_curPlayIndex = curPlayIndex * sizeof(float) + sCurCopyIndex;
+                player->_seekSecond = 0.f;
+                player->_totalPauseTime = 0.f;
+                player->_elapsedTime = 0.f;
+                sSdlBuffLen = 0;
+            }
+            sSdlBuffLen += needCopy;
             stream += needCopy;
             sCurCopyIndex += needCopy;
+
             if (isCopyComplete) {
                 sCurCopyIndex = 0;
+                sProcessIndex += 1;
                 isCopyComplete = false;
-				if (player->_audioDataVec.size() == sProcessIndex) {
-					player->_lock.unlock();
-					return;
-				}
+                isCurVolumeChanged = false;
+                //log("------------>sProcessIndex = %d", sProcessIndex);
+                //ÂΩìÂâçÂåÖÂ§ÑÁêÜÂÆå‰∫ÜÔºåÈÄÄÂá∫ÔºåÈò≤Ê≠¢Ê≠ªÁ≠â
+                if (player->_audioDataVec.size() == sProcessIndex) {
+                    return;
+                }
             }
         }
         else {
             SDL_Delay(100);
         }
-        player->_lock.unlock();
     }
     //needCopy = 0;
 }
@@ -82,13 +105,6 @@ void sdl_audio_callback(void *userdata, Uint8* stream, int len) {
 }
 //======================================================
 
-// AudioPlayer* AudioPlayer::getInstance(){
-//     if (!sInstance) {
-//         sInstance = new AudioPlayer;
-//     }
-//     return sInstance;
-// }
-
 AudioPlayer::AudioPlayer() :
 _totalTime(0.f),
 _elapsedTime(0.f),
@@ -98,11 +114,16 @@ _isSeek(false),
 _quit(false),
 _isLoop(false),
 _audioOk(false),
-_volume(1.f),
 _timeScale(1.f),
+_volume(1.f),
 _seekSecond(0.f),
 _totalDataSize(0),
 _skipDataSize(0),
+_curPlayIndex(0),
+_curPlayTick(0.f),
+_pauseTick(0.f),
+_totalPauseTime(0.f),
+_sdlUseDataInterval(0.f),
 _rubberStrecher(nullptr),
 _delegate(nullptr) {
 
@@ -117,37 +138,34 @@ bool AudioPlayer::initAudioContext() {
     SF_INFO sfinfo;
     memset(&sfinfo, 0, sizeof(sfinfo));
     sndfile = sf_open(_fullPath.c_str(), SFM_READ, &sfinfo);
-    _totalTime = double(sfinfo.frames) / double(sfinfo.samplerate);//µ•Œªms
-    _totalDataSize = double(sfinfo.frames) * sfinfo.channels; //Àı∑≈«∞float◊‹ ˝
+    _totalTime = double(sfinfo.frames) / double(sfinfo.samplerate);//Âçï‰Ωçms
+    _totalDataSize = double(sfinfo.frames) * sfinfo.channels; //Áº©ÊîæÂâçfloatÊÄªÊï∞
 
-    //SDL_SetMainReady();
-//     if (SDL_Init(SDL_INIT_AUDIO) != 0) {
-//         log("Could not initialize SDL - %s\n", SDL_GetError());
-//         return false;
-//     }
+    SDL_SetMainReady();
+    if (SDL_Init(SDL_INIT_AUDIO) != 0) {
+        log("Could not initialize SDL - %s", SDL_GetError());
+        return false;
+    }
 
     SDL_AudioSpec wanted_spec, spec;
     wanted_spec.freq = sfinfo.samplerate;
     wanted_spec.format = AUDIO_F32SYS;
     wanted_spec.channels = sfinfo.channels;
     wanted_spec.silence = 0;
-    wanted_spec.samples = SDL_AUDIO_BUFFER_SIZE;
+    wanted_spec.samples = 4096;//SDL_AUDIO_BUFFER_SIZE;
     wanted_spec.callback = sdl_audio_callback;
     wanted_spec.userdata = this;
 
     SDL_AudioDeviceID audioID = SDL_OpenAudio(&wanted_spec, &spec);
     if (audioID != 0) {
-        log("can't open audio.\n");
         const char * errMsg = SDL_GetError();
-        log("err%s", errMsg);
-        SDL_CloseAudio();
-        audioID = SDL_OpenAudio(&wanted_spec, &spec);
-        if (audioID != 0) {
-            return false;
-        }
+        log("AudioPlayer: can't open audio, err: %s", errMsg);
+        sf_close(sndfile);
+        return false;
     }
 
     if (spec.channels != wanted_spec.channels) {
+        sf_close(sndfile);
         log("not support channel");
         return false;
     }
@@ -157,6 +175,7 @@ bool AudioPlayer::initAudioContext() {
 //         return false;
 //     }
 
+    sf_close(sndfile);
     return true;
 }
 
@@ -164,6 +183,7 @@ bool AudioPlayer::initAudio(const char* audioPath) {
     _fullPath =  FileUtils::getInstance()->fullPathForFilename(audioPath);
     if (!(_fullPath.compare(""))) {
         log("audioPath scale input error!!!");
+        _delegate->excuteCallback(WanakaAudioPlayer::EventType::LoadError);
         return false;
     }
 
@@ -171,8 +191,10 @@ bool AudioPlayer::initAudio(const char* audioPath) {
         _audioOk = true;
     }
     else {
+        _delegate->excuteCallback(WanakaAudioPlayer::EventType::LoadError);
         return false;
     }
+    _delegate->excuteCallback(WanakaAudioPlayer::EventType::LoadSuccess);
     return true;
 }
 
@@ -180,14 +202,15 @@ void AudioPlayer::play(const char* audioPath, float timeScale/* = 1.f*/, bool is
     if (_isPlaying) {
         stop();
         //std::this_thread::sleep_for(std::chrono::milliseconds(10));
-       // _quit = false; //÷ÿ»Î ±Ω´ÕÀ≥ˆ±Íº«÷√false
+       // _quit = false; //ÈáçÂÖ•Êó∂Â∞ÜÈÄÄÂá∫Ê†áËÆ∞ÁΩÆfalse
     }
-    _lock.lock();
-    _quit = false; //÷ÿ»Î ±Ω´ÕÀ≥ˆ±Íº«÷√false
+
+    std::lock_guard<std::recursive_mutex> lock(_rLock);
+    _quit = false; //ÈáçÂÖ•Êó∂Â∞ÜÈÄÄÂá∫Ê†áËÆ∞ÁΩÆfalse
     sProcessIndex = 0;
     sCurCopyIndex = 0;
     sStartTimePoint = sCurTimePoint = sFirstSoundTime = 0.f;
-    _lock.unlock();
+    isCurVolumeChanged = false;
 
     _isLoop = isLoop;
     _timeScale = timeScale; //0.5 - 2.0
@@ -201,38 +224,13 @@ void AudioPlayer::play(const char* audioPath, float timeScale/* = 1.f*/, bool is
     }
 
     _isPlaying = true;
-    _totalTime *= timeScale;
     _totalDataSize *= timeScale;
 
-//     auto director = Director::getInstance();
-//     Director::getInstance()->getScheduler()->schedule([director, this](float dt) {
-//         if (_quit) {
-//             director->getScheduler()->unschedule("stecherPlayerCountDown", this);
-//         }
-//         else if (_isPlaying) {
-//             _elapsedTime += dt;
-//             if (!sFirstSound)
-//             {
-//                 time1 += dt;
-//             }
-//             if (_elapsedTime >= _totalTime) {
-//                 stop();
-//                 //                 _quit = true;
-//                 //                 reset();
-//                 director->getScheduler()->unschedule("stecherPlayerCountDown", this);
-//             }
-//         }
-//     }, this, director->getAnimationInterval(), false, "stecherPlayerCountDown");
-
-    //≤•∑≈ ±º‰º∆À„œﬂ≥Ã
-    std::thread timeThread = std::thread(&AudioPlayer::timeCalculate, this);
-    timeThread.detach();
-
-    // ˝æ›¿≠…Ïœﬂ≥Ã
+    //Êï∞ÊçÆÊãâ‰º∏Á∫øÁ®ã
     std::thread strechThread = std::thread(&AudioPlayer::strechProcess, this);
     strechThread.detach();
 
-    //ø™∆Ù“Ù∆µ¡˜¥¶¿Ìœﬂ≥Ã
+    //ÂºÄÂêØÈü≥È¢ëÊµÅÂ§ÑÁêÜÁ∫øÁ®ã
     if (_audioOk) {
         SDL_PauseAudio(0);
     }
@@ -240,6 +238,7 @@ void AudioPlayer::play(const char* audioPath, float timeScale/* = 1.f*/, bool is
 
 void AudioPlayer::strechProcess() {
     int ibs = 1024;
+    bool isScale = (_timeScale != 1.0);
     double pitchshift = 0.0;
     SNDFILE *sndfile;
     SF_INFO sfinfo;
@@ -247,10 +246,8 @@ void AudioPlayer::strechProcess() {
     sndfile = sf_open(_fullPath.c_str(), SFM_READ, &sfinfo);
     if (!sndfile) {
         log("ERROR: Failed to open input file!!!");
-        _delegate->excuteCallback(WanakaAudioPlayer::EventType::LoadError);
         return;
     }
-    _delegate->excuteCallback(WanakaAudioPlayer::EventType::LoadSuccess);
 
     size_t channels = sfinfo.channels;
     RubberBand::RubberBandStretcher::Options options = 0;
@@ -259,7 +256,7 @@ void AudioPlayer::strechProcess() {
     //options |= RubberBandStretcher::OptionStretchPrecise;
 //    options |= RubberBandStretcher::OptionStretchElastic;
 
-    //œ¬√Ê¡Ω∏ˆ—°œÓ“ª∆ø…“‘»•µÙ±‰ÀŸ∫Ûµƒ‘”…˘
+    //‰∏ãÈù¢‰∏§‰∏™ÈÄâÈ°π‰∏ÄËµ∑ÂèØ‰ª•ÂéªÊéâÂèòÈÄüÂêéÁöÑÊùÇÂ£∞
     options |= RubberBandStretcher::OptionTransientsSmooth;
     options |= RubberBandStretcher::OptionChannelsTogether;
 
@@ -276,123 +273,147 @@ void AudioPlayer::strechProcess() {
     _isStrechProcessing = true;
     audioDataFrame audioData;
     int frame = 0;
+    //int total = 0;
     float *fbuf = new float[channels * ibs];
     float **ibuf = new float *[channels];
     for (size_t i = 0; i < channels; ++i) ibuf[i] = new float[ibs];
     while (frame < sfinfo.frames) {
-        _lock.lock();
+        std::lock_guard<std::recursive_mutex> lock(_rLock);
         if (_quit) {
-            _lock.unlock();
-            return;
+            break;
         }
 
-        //¥¶¿Ìπ˝≥Ã÷–seek,÷±Ω”“∆∂ØµΩseekµƒŒª÷√Ω¯––¥¶¿Ì£¨seek«∞√Êµƒ
+        //Â§ÑÁêÜËøáÁ®ã‰∏≠seek,Áõ¥Êé•ÁßªÂä®Âà∞seekÁöÑ‰ΩçÁΩÆËøõË°åÂ§ÑÁêÜÔºåseekÂâçÈù¢ÁöÑ
         if (_isSeek) {
             _rubberStrecher->reset();
             clearCache();
             sProcessIndex = 0;
             sCurCopyIndex = 0;
             int destFrame = _seekSecond / _totalTime * sfinfo.frames;
-            if (sf_seek(sndfile, destFrame, SEEK_SET) < 0) break;
+            if (sf_seek(sndfile, destFrame, SEEK_SET) < 0) {
+                break;
+            }
             frame = destFrame;
             _skipDataSize = frame * channels * _timeScale;
             _isSeek = false;
         }
 
         int count = -1;
-        if ((count = sf_readf_float(sndfile, fbuf, ibs)) < 0) break;
-        for (size_t c = 0; c < channels; ++c) {
-            for (int i = 0; i < count; ++i) {
-                float value = fbuf[i * channels + c];
-                ibuf[c][i] = value;
-            }
-        }
-        bool final = (frame + ibs >= sfinfo.frames);
-        _rubberStrecher->process(ibuf, count, final);
-        _delegate->excuteCallback(WanakaAudioPlayer::EventType::Process);
-        int avail = _rubberStrecher->available();
-        if (avail > 0) {
-            float **obf = new float *[channels];
-            for (size_t i = 0; i < channels; ++i) {
-                obf[i] = new float[avail];
-            }
-            _rubberStrecher->retrieve(obf, avail);
+        if ((count = sf_readf_float(sndfile, fbuf, ibs)) < 0) {
+            break;
+        };
+        if (!isScale) {
+            float *fobf = new float[channels * count];
+            memcpy(fobf, fbuf, channels * count * sizeof(float));
+            //total += count;
+            //log("total = %d, sfinfo.frames = %d", total, sfinfo.frames);
 
-            float *fobf = new float[channels * avail];
-            for (size_t c = 0; c < channels; ++c) {
-                for (int i = 0; i < avail; ++i) {
-                    float value = obf[c][i];
-                    if (value > 1.f) value = 1.f;
-                    if (value < -1.f) value = -1.f;
-                    fobf[i * channels + c] = value;
-                }
-            }
-            //»Î∂”£¨¥˝ ˝æ›øΩ±¥µΩaudio
+            //ÂÖ•ÈòüÔºåÂæÖÊï∞ÊçÆÊã∑Ë¥ùÂà∞audio
             audioData.data = fobf;
-            audioData.size = channels * avail;
-            //—≠ª∑≤•∑≈ ±_audioDataQueue∂”¡–ø…“‘“ª÷±…œ’«£¨÷±Ω”À˘”–◊™ªªÕÍµƒ ˝æ›»Î∂”£¨≤ª”√ÀØ√ﬂ
+            audioData.size = channels * count;
+            //Âæ™ÁéØÊí≠ÊîæÊó∂_audioDataQueueÈòüÂàóÂèØ‰ª•‰∏ÄÁõ¥‰∏äÊ∂®ÔºåÁõ¥Êé•ÊâÄÊúâËΩ¨Êç¢ÂÆåÁöÑÊï∞ÊçÆÂÖ•ÈòüÔºå‰∏çÁî®Áù°Áú†
             _audioDataVec.push_back(audioData);
             if (!_isLoop && _audioDataVec.size() >= MAX_AUDIOQ_SIZE) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-            //_lock.unlock();
-            for (size_t i = 0; i < channels; ++i) {
-                delete[] obf[i];
-            }
-            delete[] obf;
-        }
-        frame += ibs;
-        _lock.unlock();
-    }
-
-    int avail;
-    while ((avail = _rubberStrecher->available()) >= 0) {
-        _lock.lock();
-        if (_quit) {
-            _lock.unlock();
-            return;
-        }
-        if (avail > 0) {
-            float **obf = new float *[channels];
-            for (size_t i = 0; i < channels; ++i) {
-                obf[i] = new float[avail];
-            }
-            _rubberStrecher->retrieve(obf, avail);
-            float *fobf = new float[channels * avail];
-            for (size_t c = 0; c < channels; ++c) {
-                for (int i = 0; i < avail; ++i) {
-                    float value = obf[c][i];
-                    if (value > 1.f) value = 1.f;
-                    if (value < -1.f) value = -1.f;
-                    fobf[i * channels + c] = value;
-                }
-            }
-
-            audioData.data = fobf;
-            audioData.size = channels * avail;
-            _audioDataVec.push_back(audioData);
-            if (!_isLoop && _audioDataVec.size() >= MAX_AUDIOQ_SIZE) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-
-            //_lock.unlock();
-            for (size_t i = 0; i < channels; ++i) {
-                delete[] obf[i];
-            }
-            delete[] obf;
         }
         else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            for (size_t c = 0; c < channels; ++c) {
+                for (int i = 0; i < count; ++i) {
+                    float value = fbuf[i * channels + c];
+                    ibuf[c][i] = value;
+                }
+            }
+            bool final = (frame + ibs >= sfinfo.frames);
+            _rubberStrecher->process(ibuf, count, final);
+            _delegate->excuteCallback(WanakaAudioPlayer::EventType::Process);
+            int avail = _rubberStrecher->available();
+            if (avail > 0) {
+                float **obf = new float *[channels];
+                for (size_t i = 0; i < channels; ++i) {
+                    obf[i] = new float[avail];
+                }
+                _rubberStrecher->retrieve(obf, avail);
+
+                float *fobf = new float[channels * avail];
+                for (size_t c = 0; c < channels; ++c) {
+                    for (int i = 0; i < avail; ++i) {
+                        float value = obf[c][i];
+                        if (value > 1.f) value = 1.f;
+                        if (value < -1.f) value = -1.f;
+                        fobf[i * channels + c] = value;
+                    }
+                }
+                //ÂÖ•ÈòüÔºåÂæÖÊï∞ÊçÆÊã∑Ë¥ùÂà∞audio
+                audioData.data = fobf;
+                audioData.size = channels * avail;
+                //Âæ™ÁéØÊí≠ÊîæÊó∂_audioDataQueueÈòüÂàóÂèØ‰ª•‰∏ÄÁõ¥‰∏äÊ∂®ÔºåÁõ¥Êé•ÊâÄÊúâËΩ¨Êç¢ÂÆåÁöÑÊï∞ÊçÆÂÖ•ÈòüÔºå‰∏çÁî®Áù°Áú†
+                _audioDataVec.push_back(audioData);
+                if (!_isLoop && _audioDataVec.size() >= MAX_AUDIOQ_SIZE) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+                for (size_t i = 0; i < channels; ++i) {
+                    delete[] obf[i];
+                }
+                delete[] obf;
+            }
         }
-        _lock.unlock();
+        frame += ibs;
+    }
+
+    if (isScale) {
+        int avail;
+        while ((avail = _rubberStrecher->available()) >= 0) {
+            std::lock_guard<std::recursive_mutex> lock(_rLock);
+            if (_quit) {
+                break;
+            }
+            if (avail > 0) {
+                float **obf = new float *[channels];
+                for (size_t i = 0; i < channels; ++i) {
+                    obf[i] = new float[avail];
+                }
+                _rubberStrecher->retrieve(obf, avail);
+                float *fobf = new float[channels * avail];
+                for (size_t c = 0; c < channels; ++c) {
+                    for (int i = 0; i < avail; ++i) {
+                        float value = obf[c][i];
+                        if (value > 1.f) value = 1.f;
+                        if (value < -1.f) value = -1.f;
+                        fobf[i * channels + c] = value;
+                    }
+                }
+
+                audioData.data = fobf;
+                audioData.size = channels * avail;
+                _audioDataVec.push_back(audioData);
+                if (!_isLoop && _audioDataVec.size() >= MAX_AUDIOQ_SIZE) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+
+                for (size_t i = 0; i < channels; ++i) {
+                    delete[] obf[i];
+                }
+                delete[] obf;
+            }
+            else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
     }
     _isStrechProcessing = false;
     sf_close(sndfile);
+    delete[] fbuf;
+    for (size_t i = 0; i < channels; ++i) {
+        delete[] ibuf[i];
+    }
+    delete[] ibuf;
 }
 
 void AudioPlayer::pause() {
     if (!_isPlaying) return;
     _isPlaying = false;
+    _pauseTick = UtilsWanakaFramework::getUnixTimestamp();
     if (_audioOk) {
         //SDL_LockAudio();
         SDL_PauseAudio(1);
@@ -400,48 +421,48 @@ void AudioPlayer::pause() {
     }
 }
 
-static bool playEnd = false;
 void AudioPlayer::stop() {
-    if (_quit) return;
-    if (_audioOk && playEnd) {
-		//_lock.lock();
-		_quit = true;
-		//_lock.unlock();
-        //SDL_LockAudio();
-        //SDL_PauseAudio(1);
-		string error = SDL_GetError();
-        //SDL_CloseAudio();
-		SDL_Quit();
-        //SDL_UnlockAudio();
-        reset();
-        _delegate->excuteCallback(WanakaAudioPlayer::EventType::Eof);
+    if (_quit) {
+        return;
     }
+
+    _isPlaying = false;
+
+    if (_audioOk) {
+        _quit = true;
+        SDL_PauseAudio(1);
+        //Âª∂Ëøü100ms,ËÆ©ÂÖ∂‰ªñÁ∫øÁ®ãÂÖàÈÄÄÂá∫Ôºå‰∏∫‰∏ãÈù¢ÁöÑsdlÁöÑcloseÔºåquitÊ≠£Â∏∏ÊâßË°å
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); 
+        //ÁªèËøáÊµãËØïËøôÈáåÁöÑclose,quitÂøÖÈ°ªÂú®sdlÂ°´ÂÖÖÊï∞ÊçÆÂõûË∞ÉÂáΩÊï∞ÈÄÄÂá∫ÂêéÊâçËÉΩËøîÂõûÔºåÂèØËÉΩÂÜÖÈÉ®ÂÆûÁé∞ÊúâÈîÅÊú∫Âà∂
+        //‰∏îÂõûË∞ÉÂáΩÊï∞ÁöÑË∞ÉÁî®ÂáΩÊï∞‰πü‰ΩøÁî®‰∫ÜËøôÊääÈîÅÔºåÊâÄ‰ª•‰∏çËÉΩËÆ©ÂõûË∞ÉËøõÂÖ•Ê≠ªÂæ™ÁéØÔºåËÄåÊó†Ê≥ïÈáäÊîæËØ•ÈîÅ
+        SDL_CloseAudio();
+        SDL_Quit();
+    }
+    reset();
+    _delegate->excuteCallback(WanakaAudioPlayer::EventType::Eof);
 }
 
 void AudioPlayer::resume() {
     if (_isPlaying) return;
     if (_audioOk) {
-        //SDL_LockAudio();
         SDL_PauseAudio(0);
-        //SDL_UnlockAudio();
-        _lock.lock();
+        std::lock_guard<std::recursive_mutex> lock(_rLock);
         sStartTimePoint = sCurTimePoint = UtilsWanakaFramework::getUnixTimestamp();
-        _lock.unlock();
+        _totalPauseTime += (sCurTimePoint - _pauseTick);
     }
     _isPlaying = true;
 }
 
 void AudioPlayer::seek(float second) {
-    second *= _timeScale;
     if (!_isPlaying) return;
     if (second > _totalTime || second < 0.f) {
         log("seek error !!!");
         return;
     }
-    _isSeek = true;
     _seekSecond = second;
+    _isSeek = true;
 
-    // ˝æ›¥¶¿ÌÕÍ±œ
+    //Êï∞ÊçÆÂ§ÑÁêÜÂÆåÊØï
 //     if (!_isStrechProcessing) {
 //         std::thread seekThread = std::thread(&AudioPlayer::seekProcess, this);
 //         seekThread.detach();
@@ -452,11 +473,11 @@ void AudioPlayer::seek(float second) {
     int index = 0;
     audioDataFrame audioData;
     bool isFind = false;
-    _lock.lock();
-    _elapsedTime = _seekSecond;
+    std::lock_guard<std::recursive_mutex> lock(_rLock);
+    //_elapsedTime = _seekSecond;
     sStartTimePoint = sCurTimePoint = UtilsWanakaFramework::getUnixTimestamp();
     if (!_isStrechProcessing) {
-        //”¶∏√µ»”⁄◊‹ ˝æ›¡ø
+        //Â∫îËØ•Á≠â‰∫éÊÄªÊï∞ÊçÆÈáè
         /* for (auto ele : _audioDataVec) {
              size += ele.size;
              }
@@ -484,7 +505,6 @@ void AudioPlayer::seek(float second) {
             _isSeek = false;
         }
     }
-    _lock.unlock();
 }
 
 void AudioPlayer::seekProcess() {
@@ -494,7 +514,7 @@ void AudioPlayer::seekProcess() {
     audioDataFrame audioData;
     bool isFind = false;
     while (true) {
-        _lock.lock();
+        std::lock_guard<std::recursive_mutex> lock(_rLock);
         for (auto ele : _audioDataVec) {
             audioData = ele;
             size += ele.size;
@@ -513,52 +533,22 @@ void AudioPlayer::seekProcess() {
         }
         if (isFind) {
             sProcessIndex = index;
-            _lock.unlock();
             break;
         }
-        _lock.unlock();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
-void AudioPlayer::timeCalculate() {
-    while (true) {
-        if (sFirstSoundTime > 0.f) {
-            _lock.lock();
-            if (_quit) {
-                _lock.unlock();
-                return;
-            }
-            else if (_isPlaying) {
-                sCurTimePoint = UtilsWanakaFramework::getUnixTimestamp();
-                _elapsedTime += (sCurTimePoint - sStartTimePoint);
-                sStartTimePoint = sCurTimePoint;
-                if (_elapsedTime >= _totalTime) {
-//                     Director::getInstance()->getScheduler()->performFunctionInCocosThread([this] {
-// 						//SDL_Quit();
-// 						SDL_Delay(100);
-//                         stop();
-//                     }
-//					);
-					playEnd = true;
-					//SDL_Quit();
-                    _lock.unlock();
-					stop();
-                    return;
-                }
-            }
-            _lock.unlock();
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-}
-
 void AudioPlayer::reset() {
-    _lock.lock();
+    std::lock_guard<std::recursive_mutex> lock(_rLock);
     _totalTime = 0.f;
     _elapsedTime = 0.f;
     _skipDataSize = 0.f;
     _totalDataSize = 0.f;
+    _curPlayIndex = 0.f;
+    _curPlayTick = 0.f;
+    _pauseTick = 0.f;
+    _totalPauseTime = 0.f;
     _isPlaying = false;
     //_quit = false;
     _isLoop = false;
@@ -566,15 +556,13 @@ void AudioPlayer::reset() {
     _isSeek = false;
     _timeScale = 1.f;
     _seekSecond = 0.f;
-
-    //_lock.lock();
+    _sdlUseDataInterval = 0.f;
     clearCache();
     if (_rubberStrecher) {
         _rubberStrecher->reset();
         delete _rubberStrecher;
         _rubberStrecher = nullptr;
     }
-    _lock.unlock();
 }
 
 void AudioPlayer::clearCache() {
@@ -585,67 +573,43 @@ void AudioPlayer::clearCache() {
 }
 
 float AudioPlayer::getDuration() {
-    return _totalTime / _timeScale;
+    return _totalTime;
 }
 
 float AudioPlayer::getCurrent() {
-    return _elapsedTime / _timeScale;
+
+    if (_quit) {
+        return 0.0f;
+    }
+
+    if (_seekSecond > 0.000001) { //Â¶ÇÊûúÂú®Ë∞ÉÁî®Êó∂ÂàöseekËøáÔºåÂàôËøîÂõû_seekSecondÔºå_seekSecond‰ºöÂú®Êï∞ÊçÆÂàáÊç¢Êó∂Ë¢´ÈáçÁΩÆ
+        return _seekSecond;
+    }
+    _sdlUseDataInterval = sSdlBuffLen / (_totalDataSize * sizeof(float)) * _totalTime;
+    double nowTick = UtilsWanakaFramework::getUnixTimestamp();
+    if (_isPlaying && _totalDataSize > 0 && _curPlayTick > 0 && _sdlUseDataInterval > 0) {
+        double maxElapsed = _elapsedTime + (_sdlUseDataInterval - _elapsedTime) * 0.9; //ËÆæÁΩÆ‰∏Ä‰∏™ÊúÄÂ§ßÁöÑÊµÅÈÄùÁÇπ
+        double realElapsed = _elapsedTime + (nowTick - _curPlayTick - _totalPauseTime) / _timeScale;
+        _elapsedTime = min(maxElapsed, realElapsed);
+        _totalPauseTime = 0;
+        _curPlayTick = nowTick;
+    }
+    //ÊØèÊ¨°Êõ¥Êñ∞Êï∞ÊçÆÂú®Ê≠åÊõ≤ÊÄªÈïøÂ∫¶‰∏≠ÁöÑÊó∂Èó¥‰ΩçÁΩÆ
+    double updateTick = _curPlayIndex / (_totalDataSize * sizeof(float)) * _totalTime;
+    double curTime = updateTick + _elapsedTime;
+//     log("c++ _elapsedTime = %f, _curPlayIndex = %f, _curPlayTick = %f, _totalDataSize = %f, nowTick = %f, _totalPauseTime = %f, _timeScale = %f, curTime = %f", _elapsedTime,
+//         _curPlayIndex, _curPlayTick, _totalDataSize, nowTick, _totalPauseTime, _timeScale, curTime);
+    return curTime;
 }
 
-// void AudioPlayer::setVolume(float v) {
-// 	if (v < 0.f) v = 0.f;
-// 	if (v > 1.f) v = 1.f;
-// 	
-// 	//The nVolume parameter must be between 0.0 and 1.0.
-// 	//0.0 means mute and 1.0 means 100.
-// 	bool bScalar = true;
-// 	HRESULT hr=NULL;
-// 	bool decibels = false;
-// 	bool scalar = false;
-// 	double newVolume=v;
-// 
-// 	CoInitialize(NULL);
-// 	IMMDeviceEnumerator *deviceEnumerator = NULL;
-// 	hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_INPROC_SERVER, 
-// 		__uuidof(IMMDeviceEnumerator), (LPVOID *)&deviceEnumerator);
-// 	IMMDevice *defaultDevice = NULL;
-// 
-// 	hr = deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defaultDevice);
-// 	deviceEnumerator->Release();
-// 	deviceEnumerator = NULL;
-// 
-// 	IAudioEndpointVolume *endpointVolume = NULL;
-// 	hr = defaultDevice->Activate(__uuidof(IAudioEndpointVolume), 
-// 		CLSCTX_INPROC_SERVER, NULL, (LPVOID *)&endpointVolume);
-// 	defaultDevice->Release();
-// 	defaultDevice = NULL;
-// 
-// 	// -------------------------
-// 	float currentVolume = 0;
-// 	endpointVolume->GetMasterVolumeLevel(&currentVolume);
-// 	//printf("Current volume in dB is: %f\n", currentVolume);
-// 
-// 	hr = endpointVolume->GetMasterVolumeLevelScalar(&currentVolume);
-// 	//CString strCur=L"";
-// 	//strCur.Format(L"%f",currentVolume);
-// 	//AfxMessageBox(strCur);
-// 
-// 	// printf("Current volume as a scalar is: %f\n", currentVolume);
-// 	if (bScalar==false)
-// 	{
-// 		hr = endpointVolume->SetMasterVolumeLevel((float)newVolume, NULL);
-// 	}
-// 	else if (bScalar==true)
-// 	{
-// 		hr = endpointVolume->SetMasterVolumeLevelScalar((float)newVolume, NULL);
-// 	}
-// 	endpointVolume->Release();
-// 
-// 	CoUninitialize();
-// }
+void AudioPlayer::setVolume(float volume) {
+    //if (!_isPlaying) return;
+    if (volume < 0.0000001) volume = 0.f;
+    if (volume > 1.f) volume = 1.f;
+    _volume = volume;
+}
 
-void AudioPlayer::setVolume(float v) {
-	if (v < 0.f) v = 0.f;
-	if (v > 1.f) v = 1.f;
-	_volume = v;
+void AudioPlayer::process() {
+    if (_isPlaying)
+        _delegate->excuteCallback(WanakaAudioPlayer::EventType::Process);
 }

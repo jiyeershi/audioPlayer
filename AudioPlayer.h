@@ -1,12 +1,12 @@
-#ifndef __AudioPlayer__
+ï»¿#ifndef __AudioPlayer__
 #define __AudioPlayer__
 
 #include <string>
 #include <queue>
 #include <mutex>
-#include "cocos2d.h"
 #include "RubberBandStretcher.h"
 #include "sndfile.h"
+#include "cocos2d.h"
 
 struct audioDataFrame {
     float* data;
@@ -21,17 +21,17 @@ public:
 
     //static AudioPlayer* getInstance();
 
-    //²¥·Å¿ØÖÆ
-    void play(const char* audioPath, float timeScale = 1.f, bool isLoop = false); //¿ªÊ¼²¥·Å»òÈ¡ÏûÔİÍ£ isLoopÎªtrueÔòÑ­»·²¥·Å
+    //æ’­æ”¾æ§åˆ¶
+    void play(const char* audioPath, float timeScale = 1.f, bool isLoop = false); //å¼€å§‹æ’­æ”¾æˆ–å–æ¶ˆæš‚åœ isLoopä¸ºtrueåˆ™å¾ªç¯æ’­æ”¾
     void pause();
     void resume();
     void stop();
     void seek(float second);
     bool isPlaying() { return _isPlaying; }
 
-    float getDuration();  //»ñÈ¡×ÜÊ±³¤£¨µ¥Î»£ºÃë£©
-    float getCurrent();   //»ñÈ¡µ±Ç°²¥·ÅÁËµÄÊ±³¤£¨µ¥Î»£ºÃë£©
-	void setVolume(float v); //vµÄ·¶Î§Îª0-1
+    float getDuration();  //è·å–æ€»æ—¶é•¿ï¼ˆå•ä½ï¼šç§’ï¼‰
+    float getCurrent();   //è·å–å½“å‰æ’­æ”¾äº†çš„æ—¶é•¿ï¼ˆå•ä½ï¼šç§’ï¼‰
+    void setVolume(float volume); //vçš„èŒƒå›´ä¸º0-1.f
 
     void setDelegate(WanakaAudioPlayer* delegate){ _delegate = delegate; };
 private:
@@ -39,13 +39,14 @@ private:
     bool initAudioContext();
     void strechProcess();
     void seekProcess();
-    void timeCalculate(); //²¥·ÅÊ±¼äÀÛ»ı¼ÆËã
+    void timeCalculate(); //æ’­æ”¾æ—¶é—´ç´¯ç§¯è®¡ç®—
+    void process();
 
-    //Çå¿Õ±äËÙÊı¾İ»º´æ
+    //æ¸…ç©ºå˜é€Ÿæ•°æ®ç¼“å­˜
     void reset();
     void clearCache();
 
-    //ÒôÆµÏß³Ì
+    //éŸ³é¢‘çº¿ç¨‹
     friend/* static */void processAudio(AudioPlayer* player, uint8_t* stream, int len);
 
 private:
@@ -55,18 +56,23 @@ private:
     bool _audioOk;
     bool _isStrechProcessing;
     bool _isSeek;
-	bool _isFinished;
     double _seekSecond;
     double _elapsedTime;
     double _totalTime;
-	float _volume;
-    int _totalDataSize;
-    int _skipDataSize; //ÔÚÊı¾İÀ­Éì´¦ÀíÕıÔÚ½øĞĞÊ±£¬½øĞĞseek²Ù×÷£¬Ìø¹ıµÄÊı¾İÁ¿, µ¥Î»£ºsizeof(float)
+    double _totalDataSize;
+    double _curPlayIndex;
+    double _curPlayTick; //è®°å½•sdlå–æ•°æ®çš„æ—¶åˆ»ï¼Œé»˜è®¤ä¸ºæ’­æ”¾æ—¶åˆ»
+    int _skipDataSize; //åœ¨æ•°æ®æ‹‰ä¼¸å¤„ç†æ­£åœ¨è¿›è¡Œæ—¶ï¼Œè¿›è¡Œseekæ“ä½œï¼Œè·³è¿‡çš„æ•°æ®é‡, å•ä½ï¼šsizeof(float)
+    double _pauseTick;
+    double _totalPauseTime; //sdlåœ¨æ’­æ”¾æ¯æ¬¡å¾—åˆ°çš„æ•°æ®çš„è¿‡ç¨‹ä¸­æš‚åœçš„æ€»æ—¶é—´
     std::string _fullPath;
     float _timeScale;
+    float _volume;
+    double _sdlUseDataInterval; //sdlä½¿ç”¨æ•°æ®æ—¶é•¿,åœ¨sdlçº¿ç¨‹ä¸­èµ‹å€¼
     RubberBand::RubberBandStretcher* _rubberStrecher;
     std::vector<audioDataFrame> _audioDataVec;
-    std::mutex _lock;
+    //std::mutex _lock;
+    std::recursive_mutex _rLock;
     WanakaAudioPlayer* _delegate;
 };
 
